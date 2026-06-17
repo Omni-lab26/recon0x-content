@@ -48,62 +48,42 @@ CTF に初めて取り組んだとき、`0x41414141` とか `0b11001010` とか 
 
 ## Mermaid 図
 
-
-### 挿入図: 2進数・16進数・ASCIIの関係
+挿入先: `## 仕組み`
 
 ```mermaid
 flowchart TD
-    A[同じ1バイト] --> B[2進数: 01000001]
-    A --> C[16進数: 0x41]
-    A --> D[10進数: 65]
-    A --> E[ASCII: A]
-    B --> F[4ビットずつ区切る]
+    A[1バイトのデータ] --> B[2進数 01000001]
+    A --> C[16進数 0x41]
+    A --> D[10進数 65]
+    A --> E[ASCII A]
+    B --> F[4ビットごとに区切る]
     F --> C
-    C --> G[バイナリ解析で読みやすい]
 ```
 
-### 挿入図: ビット演算の種類分類
+挿入先: `## 種類分類`
 
 ```mermaid
 flowchart TD
-    A[ビット演算] --> B[AND: 必要なビットだけ取り出す]
-    A --> C[OR: ビットを立てる]
-    A --> D[XOR: 違うビットだけ1]
-    A --> E[NOT: 反転]
-    A --> F[SHIFT: 左右にずらす]
-    B --> G[権限チェック]
-    D --> H[XOR暗号]
-    F --> I[パケット解析]
+    A[ビット演算] --> B[AND 必要なビットを取り出す]
+    A --> C[OR ビットを立てる]
+    A --> D[XOR 違うビットだけ1]
+    A --> E[NOT 反転]
+    A --> F[SHIFT 左右にずらす]
 ```
 
-### 挿入図: 権限ビット誤用の攻撃フロー
+挿入先: `## 攻撃フロー`
 
 ```mermaid
 sequenceDiagram
-    actor A as 攻撃者
-    participant W as Webアプリ
-    participant C as 権限チェック
-    participant D as 管理機能
-
-    A->>W: perm=255 / perm=-1 を送信
-    W->>C: 外部入力を権限値として渡す
-    C->>C: userPerm & ADMIN を評価
-    C-->>W: ADMINビット一致
-    W->>D: 管理者操作を許可
-    D-->>A: アクセス成功
-```
-
-### 挿入図: 演習環境の構成
-
-```mermaid
-graph TD
-    A[自宅VM / CTF環境] --> B[Python]
-    A --> C[xxd]
-    A --> D[CyberChef]
-    B --> E[2進数/16進数変換]
-    B --> F[XOR確認]
-    C --> G[バイナリダンプ]
-    D --> H[GUIで変換確認]
+    actor 攻撃者
+    participant Webアプリ
+    participant 権限処理
+    participant 管理機能
+    攻撃者->>Webアプリ: perm=255 を送信
+    Webアプリ->>権限処理: 外部入力を権限値として評価
+    権限処理->>権限処理: userPerm & ADMIN
+    権限処理-->>Webアプリ: ADMINビット一致
+    Webアプリ-->>攻撃者: 管理機能へアクセス許可
 ```
 
 
@@ -697,6 +677,9 @@ def encrypt(plaintext: bytes, key: bytes) -> bytes:
 | マジックナンバー | ハードコードされた権限値 | 定数（`define` / `const`）で管理し、外部入力とは分離 |
 
 ---
+
+
+![XORによる簡易暗号](./images/4.png)
 
 ## 実演ラボ案内
 
