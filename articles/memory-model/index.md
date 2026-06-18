@@ -8,9 +8,7 @@ publishedAt: "2026-06-17"
 description: "プロセスのメモリ空間（スタック・ヒープ・BSS・テキスト）を図解し、スタックバッファオーバーフロー・use-after-free・heap spray の仕組みと防御策を体系的に解説する。Pwn / Binary Exploitation の必須前提知識。"
 heroImage: "/articles/memory-model/hero.png"
 tags: ["Pwn", "メモリ", "スタック", "ヒープ", "バッファオーバーフロー", "use-after-free", "Foundation", "Binary"]
-<!-- 修正: prerequisites に assembly-basics / c-basics / gdb-basics を追加（HTB Intro to Binary Exploitation の前提） -->
 prerequisites: ["bitwise-basics", "linux-basics", "terminal-basics", "programming-basics", "assembly-basics", "c-basics", "gdb-basics"]
-<!-- 修正: CVE-2023-0386 はメモリモデルとの直接関連が弱いため relatedCves から削除 -->
 relatedCves: ["CVE-2021-3156", "CVE-2022-0185"]
 ---
 
