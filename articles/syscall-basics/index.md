@@ -17,36 +17,48 @@ relatedCves: ["CVE-2022-0847", "CVE-2016-5195", "CVE-2022-23222"]
 - カーネルはすべての syscall を受け取り、呼び出し元の権限を検証してからハードウェアを操作する。この境界を突破できれば、攻撃者は任意コード実行・権限昇格・コンテナエスケープを実現できる。
 - 攻撃者は `execve()` で任意コマンドを起動し、`mmap()` でメモリを操作し、脆弱な eBPF 実装や検証不備を悪用して権限昇格につながる場合がある——いずれも syscall を通じて行われる。
 
-> **本記事で前提とする用語の超ざっくり整理**
-> - **システムコール（syscall）**: プログラムが OS の機能を呼び出すための仕組み。Linux x86-64 では数百種類以上が定義されている。
-> - **syscall 番号**: カーネルへ「どの機能を使いたいか」を伝える整数 ID。`read = 0`、`write = 1`、`execve = 59` など。
-> - **ユーザー空間（User Space）**: 一般のプログラムが動く領域。ハードウェアに直接アクセスできない。
-> - **カーネル空間（Kernel Space）**: OS のコアが動く特権領域。ハードウェアを直接制御できる。
-> - **特権レベル（Ring）**: CPU が「どこまでの命令を実行できるか」を段階的に管理する仕組み。Ring 0 がカーネル（全権限）、Ring 3 が一般プログラム（制限あり）。
-> - **execve()**: 指定したプログラムを起動する syscall。コマンドインジェクション攻撃の最終ゴールはここに到達すること。
-> - **mmap()**: ファイルや匿名メモリを仮想アドレス空間へ割り当てる syscall（Memory MAP の略）。
-> - **fork()**: 現在のプロセスを複製して子プロセスを作る syscall。
-> - **seccomp**: Secure Computing の略。プロセスが呼び出せる syscall を制限するカーネル機能。コンテナや sandbox に広く使われる。
-> - **strace**: プロセスが発行する syscall をリアルタイムで記録するデバッグツール（system call trace の略）。
-> - **CTF**: Capture The Flag。Pwn カテゴリでは syscall の悪用が頻出テーマ。
-> - **eBPF**: 拡張 Berkeley Packet Filter の略。Linux カーネル内でプログラムを動的に実行できる仕組み。`bpf()` syscall 経由で操作する。
-> - **UID**: User ID の略。Linux がユーザーを識別するための数値 ID。root は 0、一般ユーザーは 1000 以上が多い。
-
 ---
 
 ## なぜ重要か
 
-先に `process-and-thread` を読んだ方は、プロセスとスレッドがメモリ空間を使うことを知っている。では、ファイルを開いたりネットワーク通信したりするとき、プログラムは一体何をしているのか——その答えがすべて syscall に書かれている。
+「Web アプリがファイルを開くとき、プログラムの内部では一体何が起きているのか？」
 
-Web アプリが `/etc/passwd` を読んでいれば `open()` と `read()` が呼ばれる。新しいプロセスを起動すれば `fork()` と `execve()` が呼ばれる。ネットワーク通信があれば `socket()`・`connect()`・`send()` が呼ばれる。
+この問いに即答できないなら、この記事が助けになる。答えはシンプルだ——**ファイル読み書き・プロセス生成・ネットワーク通信はすべて syscall を通じてカーネルに依頼される**。syscall の仕組みを知れば、コマンドインジェクション・権限昇格・コンテナエスケープがどの経路で起きるかを根本から追えるようになる。
 
-セキュリティの文脈で syscall の知識が必要になる場面は多い。
+具体的に挙げると：
 
 - **コマンドインジェクション**: `shell_exec()`・`exec()` は内部で `execve()` を呼ぶ。入力が汚染されていると攻撃者が任意の `execve()` を実行できる。
 - **権限昇格**: `execve()`・`mmap()`・`mprotect()` の組み合わせがバッファオーバーフロー後の典型的な攻撃チェーンだ。
 - **コンテナエスケープ**: コンテナ内のプログラムがホストカーネルの脆弱な syscall ハンドラを呼ぶことで隔離を破る（CVE-2022-0847 など）。
 - **サンドボックス検出・回避**: seccomp が `execve()` を禁止しているかどうかを確認する技術は CTF でも頻出だ。
 - **マルウェア解析**: `strace` で発行 syscall を記録すれば、難読化されたコードが実際に何をしているかを把握できる。
+
+---
+
+## 読む前に確認したい用語
+
+難しい用語は出てきたタイミングで解説するが、以下の概念は記事全体を通して何度も登場する。ざっと目を通してから先に進もう。
+
+**syscall の基本構造**
+- **システムコール（syscall）**: プログラムが OS の機能を呼び出すための仕組み。Linux x86-64 では数百種類以上が定義されている。
+- **syscall 番号**: カーネルへ「どの機能を使いたいか」を伝える整数 ID。`read = 0`、`write = 1`、`execve = 59` など。
+- **ユーザー空間（User Space）**: 一般のプログラムが動く領域。ハードウェアに直接アクセスできない。
+- **カーネル空間（Kernel Space）**: OS のコアが動く特権領域。ハードウェアを直接制御できる。
+- **特権レベル（Ring）**: CPU が「どこまでの命令を実行できるか」を段階的に管理する仕組み。Ring 0 がカーネル（全権限）、Ring 3 が一般プログラム（制限あり）。
+
+**重要な syscall**
+- **execve()**: 指定したプログラムを起動する syscall。コマンドインジェクション攻撃の最終ゴールはここに到達すること。
+- **mmap()**: ファイルや匿名メモリを仮想アドレス空間へ割り当てる syscall（Memory MAP の略）。
+- **fork()**: 現在のプロセスを複製して子プロセスを作る syscall。
+
+**セキュリティ保護と解析ツール**
+- **seccomp**: Secure Computing の略。プロセスが呼び出せる syscall を制限するカーネル機能。コンテナや sandbox に広く使われる。
+- **strace**: プロセスが発行する syscall をリアルタイムで記録するデバッグツール（system call trace の略）。
+- **eBPF**: 拡張 Berkeley Packet Filter の略。Linux カーネル内でプログラムを動的に実行できる仕組み。`bpf()` syscall 経由で操作する。
+
+**識別子**
+- **UID**: User ID の略。Linux がユーザーを識別するための数値 ID。root は 0、一般ユーザーは 1000 以上が多い。
+- **CTF**: Capture The Flag。Pwn カテゴリでは syscall の悪用が頻出テーマ。
 
 ---
 
@@ -63,8 +75,6 @@ CPU は「どの命令を実行できるか」を特権レベル（Ring）で管
 
 ### syscall が呼ばれるまでの流れ
 
-この図は「アプリが `write()` を呼ぶ」ときのフローを示している。見るポイントは Ring3 から Ring0 への特権レベル移行（Ring0移行）、権限チェックの位置、そして seccomp が割り込める場所だ。
-
 ```mermaid
 %%{init: {"theme":"base","themeVariables":{"background":"#0b1117","primaryColor":"#1b222a","primaryBorderColor":"#7fb6e8","primaryTextColor":"#e6edf3","lineColor":"#9db6c9","secondaryColor":"#111827","tertiaryColor":"#0b1117"}}}%%
 flowchart LR
@@ -74,6 +84,10 @@ flowchart LR
     D --> E[HW操作]
     E --> F[結果を返す]
 ```
+
+Ring 3（ユーザーモード）から Ring 0（カーネルモード）への移行が中心にあり、権限チェックはこの移行後にカーネル側で行われる——この「境界を越える構造」が syscall のすべてだ。seccomp はこの `syscall 命令` と `Ring0移行` の間に割り込んでフィルタリングする。
+
+**計算量まとめ**
 
 具体的な手順は次の通りだ。
 
@@ -89,9 +103,11 @@ flowchart LR
 > **`int 0x80` とは**: 割り込み番号 128（16進数で `0x80`）を発生させる命令。Linux カーネルがこの割り込みをかつて syscall 処理のエントリポイントとして使っていた。
 > **errno とは**: エラーの種類を示すグローバル変数。EPERM = 1（権限不足）、ENOENT = 2（ファイルなし）など。カーネルが負の errno をカーネル内部で返し、libc が変換する。
 
-### 攻撃フロー — execve() への到達と権限チェック
+**syscall の弱点 — 権限チェックの実装バグと seccomp 迂回**
 
-この図は「攻撃者がコマンドインジェクションを通じて `execve()` に到達し、シェルを起動しようとする流れ」と「カーネルの権限チェックでブロックされる流れ」を示している。
+カーネルの syscall ハンドラに実装バグがあると権限チェックが無効化される（CVE-2022-0847 など）。また seccomp フィルタが不完全だと、許可された syscall の組み合わせで禁止操作を代替される場合がある。
+
+### 攻撃フロー — execve() への到達と権限チェック
 
 > **`/bin/sh` とは**: Linux に標準搭載されているシェルプログラム（`/bin` ディレクトリにある `sh` コマンド）。コマンドの解釈・実行を担当する。`execve('/bin/sh', ...)` の呼び出しに成功すると攻撃者が対話的シェルを手に入れる。
 > **EPERM とは**: Error PERMission の略。カーネルが「この操作を行う権限がない」と判断したときに返すエラーコード（errno 値は 1）。libc 経由では `-1` が戻り値になり `errno` に 1 がセットされる。
@@ -115,7 +131,32 @@ sequenceDiagram
     Note over A,K: seccomp で制限可能
 ```
 
+「権限チェック OK」と「権限チェック NG」の分岐点が攻撃成否を決める。コマンドインジェクションはアプリの権限で `execve` を呼べてしまう状態であり、seccomp で `execve` 自体を禁止するとシェル取得を構造的に防げる。
+
 > **seccomp（Secure Computing）とは**: プロセスが呼び出せる syscall の種類を制限するカーネル機能。Docker コンテナは seccomp プロファイルで `ptrace()`・`mount()` などの危険な syscall を自動的にブロックしている。
+
+---
+
+## よくある誤解
+
+実装に進む前に、間違えやすいポイントを整理しておく。「あー、そうか」と思えるものがあれば、コードを書くときに思い出してほしい。
+
+**「Python / PHP は高水準言語だから syscall は関係ない」**
+すべての言語ランタイムは最終的に syscall を発行する。ファイルを開くと `open()`/`openat()`、ネットワーク通信すると `connect()`・`send()` が呼ばれる。**高水準 API はそれらの薄いラッパーにすぎない**。
+
+**「syscall は何でも自由に呼べる」**
+ユーザー空間からカーネル空間への移行時に、カーネルは呼び出し元の UID・GID・ケーパビリティ（capability）を必ず検証する。**たとえば一般ユーザーが `mount()` を呼ぶと `EPERM` エラーが返る**。seccomp が有効なら禁止された syscall は `SIGSYS` シグナルでプロセスが kill される。
+
+> **ケーパビリティ（capability）とは**: root の権限を細かく分割した仕組み。`CAP_NET_BIND_SERVICE`（1024 番以下のポートにバインド）・`CAP_SYS_PTRACE`（ptrace 許可）・`CAP_SYS_ADMIN`（広範な管理操作）などがある。コンテナは通常、多くのケーパビリティを持たない状態で起動する。
+
+**「strace は本番環境では使えない」**
+`strace -p [PID]` はルート権限があれば実行中のプロセスにアタッチできる。ただし `ptrace_scope` が 1 以上だと制限される。**インシデント対応や forensics（デジタルフォレンジクス）では本番環境で strace を使う場面がある**。
+
+**「seccomp を設定すればコマンドインジェクションを防げる」**
+seccomp は「どの syscall を許可するか」を制御するが、許可された syscall（`execve` など）の引数は制御しない。**`execve('/bin/sh', ...)` を禁止していなければコマンドインジェクションは成立する**。入力バリデーションと seccomp は補完関係であり、どちらか一方だけでは不十分だ。
+
+**「コンテナ内では外部への syscall は届かない」**
+Docker コンテナはホスト OS のカーネルを共有している。コンテナ内のプロセスが発行する syscall はホストカーネルの syscall ハンドラに届く。**カーネル自体に脆弱性があれば（CVE-2022-0847 など）、コンテナ内から syscall を悪用してホストを攻撃できる**。
 
 ---
 
@@ -136,7 +177,7 @@ echo htmlspecialchars($content ?? '');
 > **`shell_exec()`**: PHP から OS のシェルコマンドを実行して結果を文字列で返す関数。内部的には `/bin/sh -c "コマンド"` を起動するため、最終的に `execve('/bin/sh', ['-c', コマンド], ...)` という syscall が呼ばれる。
 > **`$_GET['file']`**: URL のクエリパラメータ（`?file=xxx`）を取り出す PHP の記法。攻撃者がブラウザから自由な値を送れる。
 
-**問題点**: `$filename` を検証せずにシェルコマンドに連結している。攻撃者が `?file=output.txt;id;cat /etc/passwd` を送ると、セミコロン（`;`）がコマンド区切りとして機能し、3 つのコマンドが順番に実行される。最終的に発行される syscall は `execve('/bin/sh', ['-c', 'cat output.txt; id; cat /etc/passwd'], ...)` だ。
+**どこが問題か**: `$filename` を検証せずにシェルコマンドに連結している。攻撃者が `?file=output.txt;id;cat /etc/passwd` を送ると、セミコロンがコマンド区切りとして機能し 3 つのコマンドが順番に実行される。**最終的に `execve('/bin/sh', ['-c', 'cat output.txt; id; cat /etc/passwd'], ...)` が発行され、ブラウザから任意コマンドを実行できる**。
 
 **防御策:**
 
@@ -158,7 +199,7 @@ echo htmlspecialchars($content);
 > **`realpath()`**: シンボリックリンクや `../` を解決して絶対パスを返す PHP 関数。戻り値が `false` の場合はファイルが存在しないか読み取り不可。
 > **`strncmp($path, $base_dir, strlen($base_dir))`**: 文字列の先頭 N 文字だけを比較する関数。`realpath()` で正規化したパスが `$base_dir` で始まるかを確認する。`strpos()` による比較より安全で、`/var/www/files-extra/` のような隣接ディレクトリへの誤許可を防ぐ。
 
-`shell_exec()` や `system()` をユーザー入力と組み合わせて使わない。どうしても必要な場合は `escapeshellarg()` でエスケープするか、`file_get_contents()` のようなシェルを経由しない API に置き換える。
+`shell_exec()` や `system()` をユーザー入力と組み合わせて使わない。どうしても必要な場合は `escapeshellarg()` でエスケープするか、`file_get_contents()` のようなシェルを経由しない API に置き換える。**「シェルを経由しない API に置き換える」だけで、`execve('/bin/sh', ...)` の発行経路をコードから完全に消せる。**
 
 ---
 
@@ -182,7 +223,7 @@ app.listen(3000);
 
 > **`child_process.exec()`**: Node.js でシェルコマンドを実行するモジュール。`/bin/sh -c` 経由でコマンドを実行するため、`shell_exec()` と同様に `execve('/bin/sh', ...)` syscall が発行される。
 
-**問題点**: `host` を検証せずに `nslookup ${host}` に埋め込んでいる。攻撃者が `?host=localhost;cat /etc/passwd` を送ると、シェルは `nslookup localhost; cat /etc/passwd` として実行する。
+**どこが問題か**: `host` を検証せずに `nslookup ${host}` に埋め込んでいる。攻撃者が `?host=localhost;cat /etc/passwd` を送ると、シェルは `nslookup localhost; cat /etc/passwd` として実行する。**`child_process.exec()` は裏で `/bin/sh -c` を使っているため、セミコロンや `&&`・`｜` がそのままコマンド区切りとして機能し、追加コマンドが実行される**。
 
 **防御策:**
 
@@ -203,6 +244,8 @@ app.get('/lookup', (req, res) => {
 ```
 
 > **`execFile()`**: `exec()` と違い、シェルを経由せずに直接プログラムを起動する。引数を配列で渡すためシェル解釈によるコマンドインジェクションを防げる。発行される syscall は `execve('/usr/bin/nslookup', ['nslookup', 'localhost'], ...)` のように引数が分離されている。なお、対象プログラム（nslookup 等）側の引数解釈による問題は別途考慮が必要だ。
+
+**`exec` を `execFile` に変えて引数を配列で渡すだけで、シェルが挟まらなくなりコマンドインジェクションの経路が消える。**
 
 ---
 
@@ -229,7 +272,7 @@ def ping():
 > **`subprocess.run(shell=True)`**: Python でシェルコマンドを実行する関数。`shell=True` を指定すると `/bin/sh -c "コマンド"` 経由で実行されるため、コマンドインジェクションが発生しうる。
 > **`flask`**: Python 用の軽量 Web フレームワーク。`request.args.get()` で URL クエリパラメータを取得する。
 
-**問題点**: `host` が `?host=localhost;id` のような値を持つと `ping -c 1 localhost; id` が実行される。`shell=True` がシェル解釈を有効にしているため、セミコロンや `&&`・`｜` が機能してしまう。
+**どこが問題か**: `host` が `?host=localhost;id` のような値を持つと `ping -c 1 localhost; id` が実行される。**`shell=True` がシェル解釈を有効にしているため、セミコロンや `&&`・`｜` が機能し、攻撃者はクエリパラメータを書き換えるだけで任意コマンドをサーバーで実行できる**。
 
 **防御策:**
 
@@ -266,10 +309,11 @@ def ping():
 - **長さ制限**: 入力値の最大文字数を制限する
 - **型・形式検証**: ホスト名なら RFC 準拠の形式、ID なら整数のみ、など意味レベルで検証する
 
+**`shell=True` を外してリスト形式で渡すだけで、`/bin/sh` を経由しなくなりシェル特殊文字が無効化される——この 1 行の変更がコマンドインジェクション全般への根本的な対策だ。**
+
 ---
 
 ## 実践例 / 演習例
-
 
 ### strace でアプリが発行する syscall を監視する
 
@@ -315,8 +359,6 @@ cat /proc/$(pgrep sleep | head -1)/syscall
 > **`nanosleep` とは**: ナノ秒単位でスリープする syscall（番号 35）。`sleep` コマンドはこれを呼んで待機する。
 
 ### seccomp フィルタが syscall をブロックする仕組み
-
-この図は「seccomp フィルタが有効なプロセスが syscall を発行したとき、フィルタが許可か拒否を判定する流れ」を示している。
 
 ```mermaid
 %%{init: {"theme":"base","themeVariables":{"background":"#0b1117","primaryColor":"#1b222a","primaryBorderColor":"#7fb6e8","primaryTextColor":"#e6edf3","lineColor":"#9db6c9","secondaryColor":"#111827","tertiaryColor":"#0b1117"}}}%%
@@ -431,27 +473,6 @@ python3 -c "import ctypes; ctypes.CDLL(None).write(1, b'hello syscall\n', 14)"
 これは Python から C の `write()` 関数を直接呼ぶ例。最終的に `write(1, 'hello syscall\n', 14)` syscall（`fd=1` は標準出力、`14` はバイト数）が発行される。
 
 > **`CDLL(None)`**: Python の `ctypes` で現在のプロセスにリンクされている libc を取得する方法。`None` を渡すと `dlopen(NULL)` と同等で、デフォルトの共有ライブラリが使われる。
-
----
-
-## よくある誤解
-
-**誤解 1: 「Python / PHP は高水準言語だから syscall は関係ない」**
-すべての言語ランタイムは最終的に syscall を発行する。ファイルを開くと `open()`/`openat()`、ネットワーク通信すると `connect()`・`send()` が呼ばれる。高水準 API はそれらの薄いラッパーにすぎない。
-
-**誤解 2: 「syscall は何でも自由に呼べる」**
-ユーザー空間からカーネル空間への移行時に、カーネルは呼び出し元の UID・GID・ケーパビリティ（capability）を必ず検証する。たとえば一般ユーザーが `mount()` を呼ぶと `EPERM` エラーが返る。seccomp が有効なら禁止された syscall は `SIGSYS` シグナルでプロセスが kill される。
-
-> **ケーパビリティ（capability）とは**: root の権限を細かく分割した仕組み。`CAP_NET_BIND_SERVICE`（1024 番以下のポートにバインド）・`CAP_SYS_PTRACE`（ptrace 許可）・`CAP_SYS_ADMIN`（広範な管理操作）などがある。コンテナは通常、多くのケーパビリティを持たない状態で起動する。
-
-**誤解 3: 「strace は本番環境では使えない」**
-`strace -p [PID]` はルート権限があれば実行中のプロセスにアタッチできる。ただし `ptrace_scope` が 1 以上だと制限される。インシデント対応や forensics（デジタルフォレンジクス：攻撃の痕跡を解析する調査手法）では本番環境で strace を使う場面がある。
-
-**誤解 4: 「seccomp を設定すればコマンドインジェクションを防げる」**
-seccomp は「どの syscall を許可するか」を制御するが、許可された syscall（`execve` など）の引数は制御しない。`execve('/bin/sh', ...)` を禁止していなければコマンドインジェクションは成立する。入力バリデーションと seccomp は補完関係であり、どちらか一方だけでは不十分だ。
-
-**誤解 5: 「コンテナ内では外部への syscall は届かない」**
-Docker コンテナはホスト OS のカーネルを共有している。コンテナ内のプロセスが発行する syscall はホストカーネルの syscall ハンドラに届く。カーネル自体に脆弱性があれば（CVE-2022-0847 など）、コンテナ内から syscall を悪用してホストを攻撃できる。
 
 ---
 
